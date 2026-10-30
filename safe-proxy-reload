@@ -1,0 +1,131 @@
+#!/bin/sh
+# safe-proxy-reload - planned restart of forkop/podkop with a fail-closed guard.
+#
+# Problem: reloading forkop/podkop stops the proxy engine, which removes its nft
+# rules and TPROXY for a few seconds. Packets from captured sources then follow the
+# normal routing table and leave through the WAN with the real (home) IP. That is a
+# leak window, not just an outage.
+#
+# This wrapper drops forwarded traffic from every captured source for the duration of
+# the restart, so the same seconds are an outage instead of an IP leak, then removes
+# the guard. A detached failsafe removes it anyway if this script dies mid-way.
+#
+# Usage:
+#   safe-proxy-reload                 # auto-detect the running service
+#   safe-proxy-reload forkop          # explicit
+#   safe-proxy-reload podkop
+#   safe-proxy-reload forkop --dry-run
+#   safe-proxy-reload forkop --window 60
+#   safe-proxy-reload forkop --guard-iif br-lan   # box captures by domain, not by IP
+#
+# Exit: 0 ok, 1 usage/detection, 2 guard failed, 3 reload failed (guard kept),
+#       4 engine did not come back in time (guard kept)
+
+set -u
+GUARD_TAG="hermes-guard"
+SVC=""
+DRY=0
+GUARD_IIF=""
+WINDOW=90
+READY_TIMEOUT=30
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		forkop|podkop) SVC="$1" ;;
+		--dry-run) DRY=1 ;;
+		--guard-iif) shift; GUARD_IIF="${1:-}" ;;
+		--window) shift; WINDOW="${1:-90}" ;;
+		-h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+		*) echo "unknown argument: $1" >&2; exit 1 ;;
+	esac
+	shift
+done
+
+running() {
+	# $1 = service name
+	[ -x "/etc/init.d/$1" ] || return 1
+	/etc/init.d/"$1" status 2>/dev/null | grep -qi running
+}
+
+if [ -z "$SVC" ]; then
+	for s in forkop podkop; do
+		if running "$s"; then SVC="$s"; break; fi
+	done
+fi
+[ -n "$SVC" ] || { echo "no forkop/podkop service found (use an explicit name)" >&2; exit 1; }
+[ -x "/etc/init.d/$SVC" ] || { echo "no /etc/init.d/$SVC on this box" >&2; exit 1; }
+
+# --- what is captured ---------------------------------------------------------
+if [ -n "$GUARD_IIF" ]; then
+	SET=$(echo "$GUARD_IIF" | tr ',' '\n' | tr -d ' ' | grep -v '^$' | while read -r i; do printf '"%s", ' "$i"; done | sed 's/, $//')
+	MATCH="iifname { $SET }"
+	DESC="interfaces: $GUARD_IIF (explicit)"
+elif [ "$SVC" = "forkop" ]; then
+	IPS=$(for s in $(uci show forkop 2>/dev/null | sed -n "s/^\(forkop\.[^.=]*\)=section$/\1/p"); do
+		[ "$(uci -q get "$s.enabled")" = "1" ] || continue
+		uci -q get "$s.fully_routed_ips"
+	done | tr ' ' '\n' | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ')
+	IPS=$(echo "$IPS" | sed 's/ $//')
+	[ -n "$IPS" ] || { echo "forkop: no enabled section with fully_routed_ips - refusing to reload without a guard" >&2; exit 1; }
+	SET=$(echo "$IPS" | sed 's/ /, /g')
+	MATCH="ip saddr { $SET }"
+	DESC="sources: $IPS"
+else
+	IFACES=$(uci get podkop.settings.source_network_interfaces 2>/dev/null | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+	IFACES=$(echo "$IFACES" | sed 's/ $//')
+	[ -n "$IFACES" ] || { echo "podkop: no source_network_interfaces found - refusing to reload without a guard" >&2; exit 1; }
+	SET=$(echo "$IFACES" | while read -r i; do printf '"%s", ' "$i"; done | sed 's/, $//')
+	MATCH="iifname { $SET }"
+	DESC="interfaces: $IFACES"
+fi
+
+echo "service=$SVC"
+echo "guard=$DESC"
+if [ "$DRY" = "1" ]; then
+	echo "dry-run: nft insert rule inet fw4 forward $MATCH counter drop comment $GUARD_TAG"
+	exit 0
+fi
+
+# --- guard --------------------------------------------------------------------
+nft insert rule inet fw4 forward $MATCH counter drop comment "$GUARD_TAG" || {
+	echo "GUARD_FAILED - nothing was reloaded" >&2; exit 2; }
+echo "guard_installed=$(nft list chain inet fw4 forward | grep -c "$GUARD_TAG")"
+
+# detached failsafe: whatever happens to this script, the guard goes away
+setsid sh -c "sleep $WINDOW; nft -a list chain inet fw4 forward | awk '/$GUARD_TAG/{print \$NF}' | while read h; do nft delete rule inet fw4 forward handle \$h; done" >/dev/null 2>&1 &
+
+remove_guard() {
+	echo "guard_counter: $(nft list chain inet fw4 forward | grep "$GUARD_TAG" | sed -n 's/.*counter packets \([0-9]*\) bytes \([0-9]*\).*/packets=\1 bytes=\2/p')"
+	nft -a list chain inet fw4 forward | awk "/$GUARD_TAG/{print \$NF}" \
+		| while read -r h; do nft delete rule inet fw4 forward handle "$h"; done
+	echo "guard_left=$(nft list chain inet fw4 forward | grep -c "$GUARD_TAG")"
+}
+
+# --- reload -------------------------------------------------------------------
+case "$SVC" in
+	forkop) /etc/init.d/forkop reload ;;
+	podkop) /etc/init.d/podkop restart ;;
+esac
+RC=$?
+if [ "$RC" != "0" ]; then
+	echo "RELOAD_FAILED rc=$RC - guard kept for $WINDOW s, remove now with: nft -a list chain inet fw4 forward | awk '/$GUARD_TAG/{print \$NF}' | while read h; do nft delete rule inet fw4 forward handle \$h; done" >&2
+	exit 3
+fi
+
+# --- wait for the engine ------------------------------------------------------
+i=0
+while [ "$i" -lt "$READY_TIMEOUT" ]; do
+	if ps w 2>/dev/null | grep -q "[s]ing-box" && nft list ruleset 2>/dev/null | grep -q "1602"; then
+		break
+	fi
+	i=$((i + 1))
+	sleep 1
+done
+if [ "$i" -ge "$READY_TIMEOUT" ]; then
+	echo "ENGINE_NOT_READY after ${READY_TIMEOUT}s - guard kept" >&2
+	exit 4
+fi
+
+sleep 1
+remove_guard
+echo "engine_ready_after=${i}s"
